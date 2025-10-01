@@ -1,7 +1,7 @@
 """
 Context-Aware Federated Nash (CAFN) Algorithm
-Author: Your Name
-Date: YYYY-MM-DD
+Author: Junyeong Park
+Last Updated: October 1st, 2025
 Description: A flexible implementation template of CAFN for federated learning with context-aware client aggregation.
 """
 
