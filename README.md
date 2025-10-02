@@ -11,3 +11,10 @@ The CAFN Algorithm is a new paradigm in Federated Learning, taking in considerat
 5. Theta-i (Δθᵢ): The client's update to the global model
 6. C-i (cᵢ): Context vector encoding client task or distribution
 7. a, c-i (a(cᵢ)): Attention-like weight for update aggregation, based on context
+
+
+### To Do
+- [] Select a dataset, worhty of applying split-dataset-federated learning
+- [] Create a federated learning network
+- [] Consider baselines for the central AI comparison
+- [] Change the value of alpha (weight of selfishness) to compare best value of alpha
