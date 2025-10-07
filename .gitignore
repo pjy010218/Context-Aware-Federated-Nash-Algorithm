@@ -1,0 +1,29 @@
+# Python 가상환경 폴더
+venv/
+ENV/
+env/
+.venv/
+
+# Python 컴파일 결과
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook 체크포인트
+.ipynb_checkpoints
+
+# 환경 설정 파일
+.env
+*.env
+
+# VS Code 설정
+.vscode/
+
+# macOS
+.DS_Store
+
+# 기타
+*.log
+*.sqlite3
+*.dat
+*.json
