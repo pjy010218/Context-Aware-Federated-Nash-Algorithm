@@ -32,6 +32,9 @@ def preprocess_dat_to_csv(dat_path, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     df = pd.read_csv(dat_path)
     df['label'] = df['label'] - df['label'].min()  # Ensure labels start at 0
+
+    df.loc[:, df.columns != 'label'] = (df.loc[:, df.columns != 'label'] - df.loc[:, df.columns != 'label'].mean()) / df.loc[:, df.columns != 'label'].std()
+
     train, test = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
     val, test = train_test_split(test, test_size=0.5, stratify=test['label'], random_state=42)
 
@@ -92,10 +95,10 @@ def evaluate_loss_fn(backbone, head, val_loader):
             total += len(yb)
     return total_loss / total if total > 0 else float('nan')
 
-def apply_delta(backbone, agg_delta):
+def apply_delta(backbone, agg_delta, lr_global=1.0):
     sd = backbone.state_dict()
     for k in sd.keys():
-        sd[k] = sd[k] + torch.from_numpy(agg_delta[k]).to(sd[k].device)
+        sd[k] = sd[k] + torch.from_numpy(agg_delta[k]).to(sd[k].device) * lr_global
     backbone.load_state_dict(sd)
 
 def evaluate_central_backbone(backbone, clients, heads):
@@ -179,12 +182,20 @@ def main(args):
     lambda_prox = args.lambda_prox
     local_epochs = args.local_epochs
     batch_size = args.batch_size
-    lr = args.lr
+    lr_local = args.lr_local
+    lr_global = args.lr_global
     beta = args.beta
     dp_sigma = args.dp_sigma
     tau = args.tau
 
-    results = {}
+    results = {
+        "alpha_results": alpha_results,
+        "NE_results": ne_results,   # <- ensure this exact key name
+        "central_acc": central_acc,
+        "personalization": personalizations,
+        "attention_weights": attention_weights.tolist(),
+        "dp_epsilon": dp_epsilon
+    }
     log = []
     log_path = os.path.join(data_dir, "cafn_training_log.jsonl")
 
@@ -214,7 +225,7 @@ def main(args):
                     lambda_prox=lambda_prox,
                     local_epochs=local_epochs,
                     batch_size=batch_size,
-                    lr=lr,
+                    lr=lr_local,
                     server_avg_loss=server_avg_loss,
                     beta=beta,
                     seed=r
@@ -234,7 +245,7 @@ def main(args):
                 heads[cname] = new_head
 
             agg_delta, weights = aggregate_attention(deltas, contexts, Wk=Wk, q_vec=q_vec, tau=tau)
-            apply_delta(backbone, agg_delta)
+            apply_delta(backbone, agg_delta, lr_global=lr_global)
 
             embed_dim = 128
             projected_ctxs = [Wk.dot(c[-embed_dim:]) if c is not None else None for c in contexts]
@@ -357,8 +368,8 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=30)
     parser.add_argument("--local_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--server_lr", type=float, default=1.0)
+    parser.add_argument("--lr_local", type=float, default=0.005, help="Local client learning rate")
+    parser.add_argument("--lr_global", type=float, default=0.001, help="Global server learning rate")
     parser.add_argument("--lambda_prox", type=float, default=0.1)
     parser.add_argument("--aggregation", type=str, default="attention")
     parser.add_argument("--dp_sigma", type=float, default=0.01)
