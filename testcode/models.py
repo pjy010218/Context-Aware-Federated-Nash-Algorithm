@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MLPBackbone(nn.Module):
-    def __init__(self, input_dim=128, hidden_dims=[256,128], embed_dim=128):
+    def __init__(self, input_dim=128, hidden_dims=[512,256], embed_dim=256):
         super().__init__()
         layers = []
         prev = input_dim
@@ -17,8 +17,13 @@ class MLPBackbone(nn.Module):
         return self.net(x)  # returns embedding
 
 class Head(nn.Module):
-    def __init__(self, embed_dim=128, out_dim=2):
+    def __init__(self, embed_dim, out_dim):
         super().__init__()
-        self.fc = nn.Linear(embed_dim, out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, out_dim)
+        )
+
     def forward(self, x):
-        return self.fc(x)
+        return self.net(x)
