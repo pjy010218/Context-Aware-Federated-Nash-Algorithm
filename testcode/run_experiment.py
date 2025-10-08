@@ -28,34 +28,39 @@ def combine_dat_files(dat_files, combined_path):
     print(f"Combined {len(dat_files)} .dat files into {combined_path}")
 
 def preprocess_dat_to_csv(dat_path, out_dir):
-    """Reads a .dat LibSVM-style dataset and writes per-client CSV splits."""
-
+    """Create per-client splits with shared label space but domain bias."""
     os.makedirs(out_dir, exist_ok=True)
     df = pd.read_csv(dat_path)
+    df['label'] = df['label'] - df['label'].min()  # Ensure labels start at 0
+    train, test = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
+    val, test = train_test_split(test, test_size=0.5, stratify=test['label'], random_state=42)
 
-    # Create 3 domain splits (by label subsets or random splits)
-    # Example: each client gets a different subset of gas labels
-    unique_labels = sorted(df['label'].unique())
-    splits = {
-        "clientA": unique_labels[:2],
-        "clientB": unique_labels[2:4],
-        "clientC": unique_labels[4:],
-    }
+    def domain_filter(df, bias_label):
+        # Oversample bias_label, but also sample from all classes (with possible repeats)
+        # Ensures every class is present in the client data
+        all_labels = df['label'].unique()
+        # Get all samples of the bias label
+        bias_samples = df[df['label'] == bias_label]
+        # Sample 30% of the full data (could include bias_label again)
+        mixed_samples = df.sample(frac=0.3, random_state=42)
+        # Concatenate and shuffle
+        biased = pd.concat([bias_samples, mixed_samples])
+        # Ensure at least one sample from every class (class coverage ≥ 70%)
+        for lbl in all_labels:
+            if (biased['label'] == lbl).sum() == 0:
+                # Add one random sample of this class
+                extra = df[df['label'] == lbl].sample(n=1, random_state=42)
+                biased = pd.concat([biased, extra])
+        return biased.sample(frac=1.0, random_state=42)
 
-    for cname, lbls in splits.items():
-        subdf = df[df['label'].isin(lbls)].copy()
-        # Remap labels to 0...num_labels-1 for each client
-        label_map = {orig: i for i, orig in enumerate(sorted(lbls))}
-        subdf['label'] = subdf['label'].map(label_map)
-        if len(subdf) < 5:
-            train, val, test = subdf, subdf.iloc[[]], subdf.iloc[[]]
-        else:
-            train, test = train_test_split(subdf, test_size=0.2, random_state=42)
-            if len(test) < 2:
-                val, test = test, test.iloc[[]]
-            else:
-                val, test = train_test_split(test, test_size=0.5, random_state=42)
-        train.to_csv(os.path.join(out_dir, f"{cname}_train.csv"), index=False)
+    # Each client gets all labels, but with a different bias
+    clientA = domain_filter(train, 1)
+    clientB = domain_filter(train, 3)
+    clientC = domain_filter(train, 5)
+
+    # All clients get the same val/test sets (shared label space)
+    for cname, ctrain in zip(['clientA', 'clientB', 'clientC'], [clientA, clientB, clientC]):
+        ctrain.to_csv(os.path.join(out_dir, f"{cname}_train.csv"), index=False)
         val.to_csv(os.path.join(out_dir, f"{cname}_val.csv"), index=False)
         test.to_csv(os.path.join(out_dir, f"{cname}_test.csv"), index=False)
         print(f"✅ Saved {cname} train/val/test CSVs.")
@@ -155,10 +160,12 @@ def main(args):
         dat_path = os.path.join(args.data_dir, "batch7.dat")  # or your default
     
     preprocess_dat_to_csv(dat_path, args.data_dir)
+    num_labels = len(pd.read_csv(dat_path)['label'].unique())
+
     clients = {
-        "clientA": {"train": f"{data_dir}/clientA_train.csv", "val": f"{data_dir}/clientA_val.csv", "test": f"{data_dir}/clientA_test.csv", "num_labels": 2},
-        "clientB": {"train": f"{data_dir}/clientB_train.csv", "val": f"{data_dir}/clientB_val.csv", "test": f"{data_dir}/clientB_test.csv", "num_labels": 2},
-        "clientC": {"train": f"{data_dir}/clientC_train.csv", "val": f"{data_dir}/clientC_val.csv", "test": f"{data_dir}/clientC_test.csv", "num_labels": 2}
+        "clientA": {"train": f"{data_dir}/clientA_train.csv", "val": f"{data_dir}/clientA_val.csv", "test": f"{data_dir}/clientA_test.csv", "num_labels": num_labels},
+        "clientB": {"train": f"{data_dir}/clientB_train.csv", "val": f"{data_dir}/clientB_val.csv", "test": f"{data_dir}/clientB_test.csv", "num_labels": num_labels},
+        "clientC": {"train": f"{data_dir}/clientC_train.csv", "val": f"{data_dir}/clientC_val.csv", "test": f"{data_dir}/clientC_test.csv", "num_labels": num_labels}
     }
 
     # Prepare validation loaders and train csv dicts
@@ -173,15 +180,18 @@ def main(args):
     local_epochs = args.local_epochs
     batch_size = args.batch_size
     lr = args.lr
-    beta = 0.1  # You can make this an argument if desired
+    beta = args.beta
     dp_sigma = args.dp_sigma
-    tau = 1.0   # You can make this an argument if desired
+    tau = args.tau
 
     results = {}
+    log = []
+    log_path = os.path.join(data_dir, "cafn_training_log.jsonl")
+
     for alpha in args.alpha_list:
         print("Running alpha =", alpha)
         backbone = MLPBackbone(input_dim=128, hidden_dims=[256,128], embed_dim=128)
-        heads = {c: Head(embed_dim=128, out_dim=clients[c]["num_labels"]) for c in clients}
+        heads = {c: Head(embed_dim=128, out_dim=num_labels) for c in clients}
         rounds = args.rounds
 
         for r in range(rounds):
@@ -211,7 +221,10 @@ def main(args):
                 )
 
                 if ctx is not None:
-                    ctx = ctx / (np.linalg.norm(ctx) + 1e-12)  # Normalize before noise
+                    # Normalize
+                    ctx = ctx / (np.linalg.norm(ctx) + 1e-12)
+                    # Whiten (zero mean, unit variance)
+                    ctx = (ctx - ctx.mean()) / (ctx.std() + 1e-12)
                     ctx_noisy = gaussian_dp_noise(ctx, sigma=dp_sigma, clip_norm=1.0)
                 else:
                     ctx_noisy = None
@@ -223,8 +236,8 @@ def main(args):
             agg_delta, weights = aggregate_attention(deltas, contexts, Wk=Wk, q_vec=q_vec, tau=tau)
             apply_delta(backbone, agg_delta)
 
-            num_hist = len([c for c in contexts if c is not None][0]) - Wk.shape[1]
-            projected_ctxs = [Wk.dot(c[num_hist:]) if c is not None else None for c in contexts]
+            embed_dim = 128
+            projected_ctxs = [Wk.dot(c[-embed_dim:]) if c is not None else None for c in contexts]
             valid_proj = np.stack([p for p in projected_ctxs if p is not None])
 
             if valid_proj.shape[0] > 0:
@@ -234,6 +247,22 @@ def main(args):
                 mean_proj /= np.linalg.norm(mean_proj) + 1e-12
                 q_vec = (1 - q_update_lr) * q_vec + q_update_lr * mean_proj
                 q_vec /= np.linalg.norm(q_vec) + 1e-12
+
+            # After aggregation and before next round
+            # Compute per-client training losses for logging
+            client_losses = {}
+            for cname in clients:
+                train_dl, _ = make_dataloader(clients[cname]["train"], batch_size=64, shuffle=False)
+                loss_val = evaluate_loss_fn(backbone, heads[cname], train_dl)
+                client_losses[cname] = float(loss_val)
+
+            log.append({
+                "round": r,
+                "alpha": alpha,
+                "server_loss": float(server_avg_loss),
+                "attention": weights.tolist(),
+                "client_losses": client_losses,
+            })
 
         perf = {}
         for cname in clients:
@@ -250,6 +279,12 @@ def main(args):
             perf[cname+"_acc"] = acc
         results[alpha] = perf
         print("alpha", alpha, "perf", perf)
+
+        # After all rounds
+        with open(log_path, "w") as f:
+            for entry in log:
+                f.write(json.dumps(entry) + "\n")
+        print(f"Saved per-round training log to {log_path}")
 
     print("\n=== Verifying Nash Equilibrium ===")
     _ = verify_nash_equilibrium(
@@ -280,23 +315,31 @@ def verify_nash_equilibrium(backbone, heads, client_train_csv, client_val_loader
         base_loss = evaluate_loss_fn(theta_ref, head_ref, client_val_loaders[cname])
         base_U = alpha * base_loss + beta * (base_loss - server_avg_loss) ** 2
 
-        delta, _, head_new = client_local_update(
-            theta_global=theta_ref,
-            head=head_ref,
-            train_csv=client_train_csv[cname],
-            alpha=alpha,
-            lambda_prox=0.0,
-            local_epochs=20,
-            batch_size=32,
-            lr=1e-3,
-            server_avg_loss=server_avg_loss,
-            beta=beta,
-            seed=42
-        )
-        new_loss = evaluate_loss_fn(theta_ref, head_new, client_val_loaders[cname])
+        # === Freeze backbone parameters ===
+        for param in theta_ref.parameters():
+            param.requires_grad = False
+
+        # Only optimize the head
+        head_ref.train()
+        opt = torch.optim.Adam(head_ref.parameters(), lr=1e-3)
+        loss_fn = torch.nn.CrossEntropyLoss()
+        train_loader, _ = make_dataloader(client_train_csv[cname], batch_size=32, shuffle=True)
+        for epoch in range(5):  # or 10 for more thorough retrain
+            for xb, yb in train_loader:
+                xb = xb.to(next(theta_ref.parameters()).device)
+                yb = yb.to(next(theta_ref.parameters()).device)
+                logits = head_ref(theta_ref(xb))
+                loss = loss_fn(logits, yb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        new_loss = evaluate_loss_fn(theta_ref, head_ref, client_val_loaders[cname])
         new_U = alpha * new_loss + beta * (new_loss - server_avg_loss) ** 2
         improvements[cname] = float(base_U - new_U)
         print(f"ΔU_{cname} = {improvements[cname]:.6f}")
+
+        print("client", cname, "base_loss", base_loss, "new_loss", new_loss, "base_U", base_U, "new_U", new_U)
 
     print("\nApproximate Nash verification results:")
     for c, val in improvements.items():
@@ -309,6 +352,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="/mnt/data/gas_clients")
     parser.add_argument("--outpath", type=str, default="cafn_results.json")  # <-- add this line
     parser.add_argument("--alpha_list", nargs="+", type=float, default=[0.0,0.1,0.25,0.5,0.75,1.0])
+    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--tau", type=float, default=0.5)
     parser.add_argument("--rounds", type=int, default=30)
     parser.add_argument("--local_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -316,6 +361,6 @@ if __name__ == "__main__":
     parser.add_argument("--server_lr", type=float, default=1.0)
     parser.add_argument("--lambda_prox", type=float, default=0.1)
     parser.add_argument("--aggregation", type=str, default="attention")
-    parser.add_argument("--dp_sigma", type=float, default=0.1)
+    parser.add_argument("--dp_sigma", type=float, default=0.01)
     args = parser.parse_args()
     main(args)

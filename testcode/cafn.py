@@ -6,6 +6,8 @@ from models import MLPBackbone, Head
 from data_utils import make_dataloader
 import copy
 import math
+import pandas as pd
+import tempfile, os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -78,10 +80,6 @@ def client_local_update(theta_global, head, train_csv, alpha=0.5, lambda_prox=0.
     - includes cooperative regularizer: beta * (local_loss - server_avg_loss)^2
     - returns delta (numpy dict), ctx (numpy), updated head.
     """
-    import pandas as pd
-    import torch.optim as optim
-    from data_utils import make_dataloader
-    import tempfile, os
     
     torch.manual_seed(seed)
     # prepare loaders as before (same code you already have)
@@ -162,21 +160,18 @@ def aggregate_attention(deltas, contexts, Wk=None, q_vec=None, tau=1.0):
         weights = np.ones(len(deltas), dtype=np.float32) / len(deltas)
         return agg, weights
 
-    num_hist = len(contexts[0]) - Wk.shape[1]  # e.g., 130 - 128 = 2
     # project contexts (Wk @ ctx) and compute cosine with q_vec
     projected = []
+    embed_dim = Wk.shape[1]  # e.g., 128
     for c in C_list:
         if c is None:
             projected.append(None)
         else:
-            # Split context into hist and mean_emb
-            hist = c[:num_hist]
-            mean_emb = c[num_hist:]
+            mean_emb = c[-embed_dim:]  # Always take the last embed_dim elements
             if Wk is None:
                 pv = mean_emb
             else:
-                pv = Wk.dot(mean_emb)   # (proj_dim,)
-            # normalize
+                pv = Wk.dot(mean_emb)
             n = np.linalg.norm(pv) + 1e-12
             pv = pv / n
             projected.append(pv)
@@ -205,7 +200,10 @@ def aggregate_attention(deltas, contexts, Wk=None, q_vec=None, tau=1.0):
     return agg, a
 
 def apply_delta(theta, delta, lr=1.0):
+    # Only update backbone parameters (exclude head parameters)
     for name, p in theta.named_parameters():
+        if "fc" in name or "head" in name:  # assuming head params have 'fc' or 'head' in their name
+            continue  # skip head parameters
         p.data = p.data + torch.from_numpy(delta[name]).to(p.device) * lr
 
 def aggregate_fedavg(deltas):
